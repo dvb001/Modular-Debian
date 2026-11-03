@@ -1,0 +1,105 @@
+#!/bin/sh
+# Handle /etc/fstab entries and /mnt directories for removable devices
+# so they are mounted under /mnt directory.
+# This script is called by /etc/udev/rules.d/10-porteux-fstab-update.rules
+
+# Variables initialized by the udev environment
+# $ACTION (add, change, remove)
+# $DEVNAME (device name including path)
+# $ID_FS_TYPE (filesystem type)
+
+# Exit if 'nohd' cheatcode is used
+grep -Eqo " nohd( |\$)" /etc/bootcmd.cfg && exit
+
+# Our variables:
+FSTAB=/etc/fstab
+DEVICE=$(echo "$DEVNAME" | sed 's_^/dev/__')
+MNTPT=/mnt/$DEVICE
+INITRD_PATH=/mnt/live
+if [ -d "${INITRD_PATH}/mnt/$DEVICE" ]; then
+    MNTPT="${INITRD_PATH}${MNTPT}"
+fi
+FS=$ID_FS_TYPE
+[ -n "$FS" ] || FS=$(/sbin/blkid "$DEVNAME" | grep -Eo ' TYPE=[^ ]+' | cut -d'"' -f2)
+cdtest=$(echo "$DEVICE" | grep ^sr)
+[ -n "$cdtest" ] && GVICON=',comment=x-gvfs-icon=media-optical-symbolic'
+
+# Make sure the part of a script after 'mutex_lock' call is atomic,
+# that means the 'locked' part of the script can never be executed
+# from several processes at the same time, in parallel.
+# Every script waits until it gathers the lock.
+# The lock directory is saved in /dev instead of /tmp, because /tmp may be
+# readonly at the time when the lock is needed (eg. when udev is starting)
+# $1 = name of the lock
+mutex_lock()
+{
+	while ! mkdir "/dev/ll-mutex-lock-$1" 2>/dev/null; do
+		usleep 100000;
+	done
+}
+
+# Unlock the lock so another waiting process can re-use it and continue
+# $1 = name of the lock
+mutex_unlock()
+{
+	rmdir "/dev/ll-mutex-lock-$1" 2>/dev/null
+}
+
+# Read the 'mopt=' or 'nmopt=' or 'rmopt=' cheatcodes in a single pass
+# over /etc/bootcmd.cfg - or use the PorteuX defaults:
+setup_mount_options() {
+	while IFS= read -r line || [ -n "$line" ]; do
+		case $line in
+			mopt=*)  MOPT=${line%% *};  MOPT=${MOPT#mopt=} ;;
+			nmopt=*) NMOPT=${line%% *}; NMOPT=${NMOPT#nmopt=} ;;
+			rmopt=*) RMOPT=${line%% *}; RMOPT=${RMOPT#rmopt=} ;;
+		esac
+	done < /etc/bootcmd.cfg
+
+	[ -n "$MOPT" ]  || MOPT="users,noatime,nodiratime,suid,dev,exec,async,nofail,x-systemd.device-timeout=1s"
+	[ -n "$NMOPT" ] || NMOPT="noatime,nodiratime,suid,nodev,exec,async,nofail,x-systemd.device-timeout=1s"
+	[ -n "$RMOPT" ] || RMOPT="noatime,nodiratime,suid,dev,exec,async,nofail"
+	if [ -e /lib/udev/rules.d/80-udisks2.rules ]; then
+		MOPT="$MOPT,comment=x-gvfs-show$GVICON"
+		NMOPT="$NMOPT,comment=x-gvfs-show$GVICON"
+	fi
+}
+
+# Replace (or create) the fstab entry for $DEVNAME; handles both the
+# 'add' and 'change' actions. The pattern is anchored by the whitespace
+# after the device field so eg. sdb1 never matches the sdb10 entry, and
+# delete+append avoids sed 's' expressions whose replacement could
+# contain the delimiter (eg. FS=linux_raid_member).
+fstab_update() {
+	sed -i "\\?^${DEVNAME}[[:space:]]?d" "$FSTAB"
+	if [ "$FS" = swap ]; then
+		echo "$DEVNAME none swap sw,pri=1 0 0" >> "$FSTAB"
+		return
+	fi
+	mkdir -p "$MNTPT"
+	if [ "$FS" = vfat ]; then
+		echo "$DEVNAME $MNTPT vfat $MOPT,umask=0,check=s,utf8 0 0" >> "$FSTAB"
+	elif [ "$FS" = ntfs ] || [ "$FS" = ntfs3 ]; then
+		echo "$DEVNAME $MNTPT $FS $NMOPT 0 0" >> "$FSTAB"
+		chmod 777 "$MNTPT"
+	elif [ "$FS" = linux_raid_member ]; then
+		echo "$DEVNAME $MNTPT $FS $RMOPT 0 0" >> "$FSTAB"
+		chmod 777 "$MNTPT"
+	else
+		echo "$DEVNAME $MNTPT $FS $MOPT 0 0" >> "$FSTAB"
+	fi
+}
+
+# Only reads static config, so do it before taking the lock:
+setup_mount_options
+
+mutex_lock udev-fstab-update
+
+if [ "$ACTION" = add ] || [ "$ACTION" = change ]; then
+	[ -n "$FS" ] && fstab_update
+elif [ "$ACTION" = remove ]; then
+	sed -i "/$DEVICE /d" "$FSTAB"
+	rmdir "$MNTPT" 2>/dev/null
+fi
+
+mutex_unlock udev-fstab-update
