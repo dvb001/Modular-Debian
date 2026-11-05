@@ -16,11 +16,17 @@ fi
 
 WORK_DIR="$PWD/target"
 BASE_CHROOT="$WORK_DIR/base-chroot"
+XORG_CHROOT="$WORK_DIR/xorg-chroot"
 GUI_CHROOT="$WORK_DIR/gui-chroot"
 DEV_CHROOT="$WORK_DIR/dev-chroot"
 
+XORG_STAGE="$WORK_DIR/xorg-stage"
 GUI_STAGE="$WORK_DIR/gui-stage"
 DEV_STAGE="$WORK_DIR/dev-stage"
+
+XORG_WORK="$WORK_DIR/xorg-work"
+GUI_WORK="$WORK_DIR/gui-work"
+DEV_WORK="$WORK_DIR/dev-work"
 
 ISO_DIR="$WORK_DIR/iso"
 OUTPUT_ISO="$WORK_DIR/debian-12-modular.iso"
@@ -33,8 +39,8 @@ rm_stage_temps() {
 
 step_prep() {
     echo "[+] 步骤 1/4: 构建基础系统 (001-base)..."
-    apt update || true
-    apt install -y debootstrap squashfs-tools initramfs-tools isolinux syslinux-utils xorriso rsync || true
+    apt update
+    apt install -y debootstrap squashfs-tools initramfs-tools isolinux syslinux-utils xorriso rsync
 
     mkdir -p "$BASE_CHROOT" "$ISO_DIR/live" "$ISO_DIR/boot" "$ISO_DIR/isolinux"
 
@@ -81,90 +87,104 @@ EOF
     echo "[+] 001-base 构建完成！"
 }
 
-step_gui() {
-    echo "[+] 步骤 2/4: 构建 MATE 桌面增量模块 (002-mate)..."
+step_xorg() {
+    echo "[+] 步骤 2/4: 构建 XORG 桌面环境模块 (002-xorg)..."
 
     # 创建必要的挂载目录和工作目录
     echo "[*] mountting overlay systems..."
+    umount "$XORG_CHROOT" 2>/dev/null || true
     read -p "Remove last stage? [y/N]" choice
-    if [[ "choice" =~ ^[Yy]$ ]]; then
-        rm -rf "$GUI_CHROOT" "$GUI_STAGE" "$WORK_DIR/gui-workdir"
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        echo "删除历史记录..."
+        rm -rf "$XORG_CHROOT" "$XORG_STAGE" "$XORG_WORK"
     fi
-    mkdir -p "$GUI_CHROOT" "$GUI_STAGE" "$WORK_DIR/gui-workdir"
+    mkdir -p "$XORG_CHROOT" "$XORG_STAGE" "$XORG_WORK"
 
     # 使用 overlay 挂载
     mount -t overlay overlay \
-        -o lowerdir="$BASE_CHROOT",upperdir="$GUI_STAGE",workdir="$WORK_DIR/gui-workdir" \
-        "$GUI_CHROOT" # 这里的 GUI_CHROOT 就是你的合并挂载点
+        -o lowerdir="$BASE_CHROOT",upperdir="$XORG_STAGE",workdir="$XORG_WORK" \
+        "$XORG_CHROOT"
+
+    echo "[*] 在 XORG Chroot 中安装 xorg 及相关软件..."
+    chroot "$XORG_CHROOT" /bin/bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        apt update && \
+        apt install -y --no-install-recommends \
+            lightdm xserver-xorg xserver-xorg-core \
+            xinit x11-xserver-utils im-config \
+            libnotify-bin \
+            fcitx5 fcitx5-config-qt fcitx5-chinese-addons \
+            fcitx5-frontend-qt5 fcitx-frontend-gtk3 \
+            pluma pluma-plugins engrampa \
+            firefox-esr \
+            gparted mesa-utils network-manager-gnome && \
+        apt clean
+    "
+    # fonts-noto-cjk fonts-noto-cjk-extra
+
+    sleep 2
+    umount "$XORG_CHROOT" || true
+    
+    # 3. 打包排重后的增量模块
+    echo "[*] 打包 002-xorg.squashfs..."
+    rm "$ISO_DIR/live/002-xorg.squashfs" 2>/dev/null || true
+    mksquashfs "$XORG_STAGE" "$ISO_DIR/live/002-xorg.squashfs" -comp xz
+    echo "[+] 002-xorg 增量模块构建完成！"
+}
+
+step_gui() {
+    echo "[+] 步骤 3/4: 构建 GUI 桌面环境模块 (003-mate)..."
+
+    # 创建必要的挂载目录和工作目录
+    echo "[*] mountting overlay systems..."
+    umount "$GUI_CHROOT" 2>/dev/null || true
+    read -p "Remove last stage? [y/N]" choice
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        echo "删除历史记录..."
+        rm -rf "$GUI_CHROOT" "$GUI_STAGE" "$GUI_WORK"
+    fi
+    mkdir -p "$GUI_CHROOT" "$GUI_STAGE" "$GUI_WORK"
+
+    # 使用 overlay 挂载
+    mount -t overlay overlay \
+        -o lowerdir="$XORG_STAGE:$BASE_CHROOT",upperdir="$GUI_STAGE",workdir="$GUI_WORK" \
+        "$GUI_CHROOT"
 
     echo "[*] 在 GUI Chroot 中安装 MATE 桌面及相关软件..."
     chroot "$GUI_CHROOT" /bin/bash -c "
         export DEBIAN_FRONTEND=noninteractive
         apt update && \
         apt install -y --no-install-recommends \
-            mate-desktop-environment-core \
-            lightdm \
-            network-manager-gnome \
-            firefox-esr \
-            gparted \
-            xserver-xorg \
-            xserver-xorg-core \
-            xinit \
-            x11-xserver-utils \
-            fonts-noto-cjk fonts-noto-cjk-extra \
-            engrampa \
-            pluma pluma-plugins \
-            mesa-utils && \
+            mate-desktop-environment-core && \
         apt clean
     "
     sleep 2
-    umount "$GUI_CHROOT" 2>/dev/null || true
-    
-    patch_base() {
-        # 2. 提取 MATE 安装时生成的系统服务账号，追加到 Base 的 passwd/group 中，避免服务因为找不到账号失败
-        echo "[*] 正在同步 MATE 模块的系统服务账号至 Base..."
-        awk -F: '$3 < 1000 {print}' "$GUI_STAGE/etc/passwd" | while read -r line; do
-            username=$(echo "$line" | cut -d: -f1)
-            if ! grep -q "^$username:" "$BASE_CHROOT/etc/passwd"; then
-                echo "$line" >> "$BASE_CHROOT/etc/passwd"
-            fi
-        done
-        awk -F: '$3 < 1000 {print}' "$GUI_STAGE/etc/group" | while read -r line; do
-            groupname=$(echo "$line" | cut -d: -f1)
-            if ! grep -q "^$groupname:" "$BASE_CHROOT/etc/group"; then
-                echo "$line" >> "$BASE_CHROOT/etc/group"
-            fi
-        done
-        
-        # 重新打包更完善的 Base 模块
-        rm "$ISO_DIR/live/001-base.squashfs" 2>/dev/null ||true
-        mksquashfs "$BASE_CHROOT" "$ISO_DIR/live/001-base.squashfs" -comp xz
-
-        rm_stage_temps "$GUI_STAGE"
-    }
+    umount "$GUI_CHROOT" || true
     
     # 3. 打包排重后的增量模块
-    echo "[*] 打包 002-mate.squashfs..."
-    rm "$ISO_DIR/live/002-mate.squashfs" 2>/dev/null || true
-    mksquashfs "$GUI_STAGE" "$ISO_DIR/live/002-mate.squashfs" -comp xz
-    echo "[+] 002-mate 增量模块构建完成！"
+    echo "[*] 打包 003-mate.squashfs..."
+    rm "$ISO_DIR/live/003-mate.squashfs" 2>/dev/null || true
+    mksquashfs "$GUI_STAGE" "$ISO_DIR/live/003-mate.squashfs" -comp xz
+    echo "[+] 003-mate 增量模块构建完成！"
 }
 
 step_dev() {
-    echo "[+] 步骤 3/4: 构建 DevTools 开发工具增量模块 (003-devtools)..."
+    echo "[+] 步骤 4/5: 构建 DevTools 开发工具增量模块 (004-devtools)..."
 
     # 创建必要的挂载目录和工作目录
     echo "[*] mountting overlay systems..."
+    umount "$DEV_CHROOT" 2>/dev/null || true
     read -p "Remove last stage? [y/N]" choice
-    if [[ "choice" =~ ^[Yy]$ ]]; then
-        rm -rf "$DEV_CHROOT" "$DEV_STAGE" "$WORK_DIR/dev-workdir"
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        echo "删除历史记录..."
+        rm -rf "$DEV_CHROOT" "$DEV_STAGE" "$DEV_WORK"
     fi
-    mkdir -p "$DEV_CHROOT" "$DEV_STAGE" "$WORK_DIR/dev-workdir"
+    mkdir -p "$DEV_CHROOT" "$DEV_STAGE" "$DEV_WORK"
 
     # 使用 overlay 挂载
     mount -t overlay overlay \
-        -o lowerdir="$GUI_STAGE:$BASE_CHROOT",upperdir="$DEV_STAGE",workdir="$WORK_DIR/dev-workdir" \
-        "$DEV_CHROOT" # 这里的 GUI_CHROOT 就是你的合并挂载点
+        -o lowerdir="$GUI_STAGE:$XORG_STAGE:$BASE_CHROOT",upperdir="$DEV_STAGE",workdir="$DEV_WORK" \
+        "$DEV_CHROOT"
 
     echo "[*] 正在从 Base 系统获取内核版本..."
     KERNEL_FILE=$(find "$BASE_CHROOT/boot" -maxdepth 1 -name "vmlinuz-*" | head -n 1)
@@ -181,7 +201,7 @@ step_dev() {
         apt update && \
         apt install -y --no-install-recommends \
             build-essential git curl wget vim htop cmake pkg-config \
-            linux-headers-amd64 gawk\
+            linux-headers-amd64 gawk gpg \
             python3 python3-pip python3-venv golang rustc cargo || true \
 
         echo '[*] 正在创建软链接以适配目标内核版本: $KERNEL_VERSION'
@@ -224,28 +244,57 @@ step_dev() {
     #rm_stage_temps "$DEV_STAGE"
     
     # 3. 打包排重后的增量模块
-    echo "[*] 打包 003-devtools.squashfs..."
-    rm "$ISO_DIR/live/003-devtools.squashfs" 2>/dev/null || true
-    mksquashfs "$DEV_STAGE" "$ISO_DIR/live/003-devtools.squashfs" -comp xz
-    echo "[+] 003-devtools 增量模块构建完成！"
+    echo "[*] 打包 004-devtools.squashfs..."
+    rm "$ISO_DIR/live/004-devtools.squashfs" 2>/dev/null || true
+    mksquashfs "$DEV_STAGE" "$ISO_DIR/live/004-devtools.squashfs" -comp xz
+    echo "[+] 004-devtools 增量模块构建完成！"
 }
 
-step_boot() {
-    echo "[+] 步骤 4/4: 提取内核、配置引导并生成 ISO..."
+make_uefi_boot() {
+    # 1. 创建一个 4MB 的空白 FAT 镜像
+    dd if=/dev/zero of="$ISO_DIR/boot/grub/efiboot.img" bs=1M count=32
+    mkfs.vfat "$ISO_DIR/boot/grub/efiboot.img"
 
-    KERNEL_FILE=$(find "$BASE_CHROOT/boot" -maxdepth 1 -name "vmlinuz-*" | head -n 1)
-    if [ -z "$KERNEL_FILE" ]; then
-        echo "[-] 错误: 未能在 $BASE_CHROOT/boot 中找到内核！"
-        exit 1
-    fi
-    
-    KERNEL_VER=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
-    echo "[*] 检测到内核版本: $KERNEL_VER"
+    # 2. 挂载镜像
+    mkdir -p /tmp/efi_install
+    mount -o loop "$ISO_DIR/boot/grub/efiboot.img" /tmp/efi_install
 
-    [ -f ./data/install.sh ] && cp ./data/install.sh "$ISO_DIR/"
-    cp "$BASE_CHROOT/boot/vmlinuz-$KERNEL_VER" "$ISO_DIR/boot/vmlinuz"
-    cp "$BASE_CHROOT/boot/initrd.img-$KERNEL_VER" "$ISO_DIR/boot/initrd.img"
+    # 3. 使用宿主机的 grub-install 直接将 GRUB 安装到这个挂载点中
+    # 这样会自动生成 EFI/BOOT/BOOTX64.EFI 以及所需的全部核心模块
+    grub-install --target=x86_64-efi \
+                --efi-directory=/tmp/efi_install \
+                --boot-directory=/tmp/efi_install/boot \
+                --removable \
+                --no-floppy \
+                --modules="normal part_gpt part_msdos fat search iso9660 linux"
 
+    # 4. 写入你正确的 grub.cfg
+    # 注意：grub-install 有时会在 /tmp/efi_install/EFI/BOOT/ 或 /tmp/efi_install/boot/grub/ 下生成 grub.cfg
+    # 我们直接在标准位置 /tmp/efi_install/EFI/BOOT/grub.cfg 覆盖写好：
+    cat << 'EOF' > /tmp/efi_install/EFI/BOOT/grub.cfg
+set timeout=5
+set default=0
+
+menuentry "Start Debian 12 Modular (UEFI)" {
+    search --no-floppy --set=root --file /boot/vmlinuz
+    linux /boot/vmlinuz boot=live components splash
+    initrd /boot/initrd.img
+}
+
+menuentry "Start Debian 12 Modular (persistence) (UEFI)" {
+    search --no-floppy --set=root --file /boot/vmlinuz
+    linux /boot/vmlinuz boot=live persistence persistence-label=ldata components splash
+    initrd /boot/initrd.img
+}
+EOF
+    cp /tmp/efi_install/EFI/BOOT/grub.cfg "$ISO_DIR/boot/grub/"
+
+    # 5. 卸载并清理
+    umount /tmp/efi_install
+    rm -rf /tmp/efi_install
+}
+
+make_iso_boot() {
     cp /usr/lib/ISOLINUX/isolinux.bin "$ISO_DIR/isolinux/"
     cp /usr/lib/syslinux/modules/bios/*.c32 "$ISO_DIR/isolinux/"
 
@@ -264,8 +313,30 @@ LABEL debian-modular-with-persistence
     KERNEL /boot/vmlinuz
     APPEND initrd=/boot/initrd.img boot=live persistence persistence-label=ldata components splash
 EOF
+}
 
-    echo "[*] 正在生成 ISO 镜像: $OUTPUT_ISO"
+step_boot() {
+    echo "[+] 步骤 5/5: 提取内核、配置引导并生成双启动 ISO (BIOS + UEFI)..."
+
+    KERNEL_FILE=$(find "$BASE_CHROOT/boot" -maxdepth 1 -name "vmlinuz-*" | head -n 1)
+    if [ -z "$KERNEL_FILE" ]; then
+        echo "[-] 错误: 未能在 $BASE_CHROOT/boot 中找到内核！"
+        exit 1
+    fi
+    
+    KERNEL_VER=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
+    echo "[*] 检测到内核版本: $KERNEL_VER"
+
+    [ -f ./data/install.sh ] && cp ./data/install.sh "$ISO_DIR/"
+    cp "$BASE_CHROOT/boot/vmlinuz-$KERNEL_VER" "$ISO_DIR/boot/vmlinuz"
+    cp "$BASE_CHROOT/boot/initrd.img-$KERNEL_VER" "$ISO_DIR/boot/initrd.img"
+
+    make_uefi_boot
+    make_iso_boot
+    
+    echo "[*] 正在生成支持 BIOS 与 UEFI 的混合 ISO 镜像: $OUTPUT_ISO"
+    
+    # 2. 在 xorriso 中加入 UEFI 引导参数 (-eltorito-alt-boot 及之后的参数)
     xorriso -as mkisofs \
         -iso-level 3 \
         -volid "DEBIAN_MODULAR" \
@@ -273,15 +344,22 @@ EOF
         -eltorito-catalog isolinux/boot.cat \
         -no-emul-boot -boot-load-size 4 -boot-info-table \
         -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+        -eltorito-alt-boot \
+        -e boot/grub/efiboot.img \
+        -no-emul-boot \
+        -isohybrid-gpt-basdat \
         -output "$OUTPUT_ISO" \
         "$ISO_DIR"
 
-    echo "[+] 制作成功！ISO 镜像路径: $OUTPUT_ISO"
+    echo "[+] 制作成功！双启动 ISO 镜像路径: $OUTPUT_ISO"
 }
 
 case "${1:-all}" in
     prep)
         step_prep
+        ;;
+    xorg)
+        step_xorg
         ;;
     gui)
         step_gui

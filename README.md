@@ -6,6 +6,8 @@ base + gui (mate) + devtools
 
 sudo ./build.sh prep
 
+sudo ./build.sh xorg
+
 sudo ./build.sh gui
 
 sudo ./build.sh dev
