@@ -51,7 +51,7 @@ step_partition_install() {
     echo "[*] 正在将 Live 系统文件复制到分区中..."
     mkdir -p "$MNT_DIR/live" "$MNT_DIR/boot"
     rsync -aHAX --info=progress2 "$ISO_DIR/live/" "$MNT_DIR/live"
-    rsync -aHAX --info=progress2 "$ISO_DIR/boot/" "$MNT_DIR/live"
+    rsync -aHAX --info=progress2 "$ISO_DIR/boot/" "$MNT_DIR/boot"
 
     echo "[*] 正在安装并配置 GRUB 引导..."
     # 创建 grub 目录结构
@@ -63,14 +63,38 @@ step_partition_install() {
 
     # 自动生成标准 grub.cfg 配置文件
     cat <<EOF > "$MNT_DIR/boot/grub/grub.cfg"
-set timeout=5
+set timeout=20
 set default=0
 
-menuentry "Debian 12 Modular Live (GRUB)" {
-    linux /live/vmlinuz boot=live persistence persistence-label=ldata components splash
-    initrd /live/initrd.img
-}
 EOF
+
+    write_boot_menu() {
+        if [ ! -f "$MNT_DIR/live/004-$1.squashfs" ];then
+            return
+        fi
+
+        local LIVE_DIR="$MNT_DIR/live-$1"
+        rm -rf "$LIVE_DIR"
+        mkdir -p "$LIVE_DIR"
+        ln -f "$MNT_DIR/live/001-base.squashfs" "$LIVE_DIR/"
+        ln -f "$MNT_DIR/live/002-devtools.squashfs" "$LIVE_DIR/"
+        ln -f "$MNT_DIR/live/003-xorg.squashfs" "$LIVE_DIR/"
+        ln -f "$MNT_DIR/live/004-$1.squashfs" "$LIVE_DIR/"
+
+        local GRUB_CFGFILE="$MNT_DIR/boot/grub/grub.cfg"
+
+        echo "menuentry \"Debian 12 Modular Live $1 (GRUB)\" {" >> "$GRUB_CFGFILE"
+        echo "    linux /boot/vmlinuz boot=live live-media-path=live-$1 persistence persistence-label=ldata components splash" >> "$GRUB_CFGFILE"
+        echo "    initrd /boot/initrd.img" >> "$GRUB_CFGFILE"
+        echo "}" >> "$GRUB_CFGFILE"
+    }
+
+    write_boot_menu mate
+    write_boot_menu kde
+    write_boot_menu xfce
+    write_boot_menu lxqt
+    write_boot_menu lxde
+    write_boot_menu cinnamon
 
     echo "[*] 正在同步数据并卸载..."
     sync
