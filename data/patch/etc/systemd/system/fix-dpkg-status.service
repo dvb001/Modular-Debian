@@ -1,0 +1,12 @@
+[Unit]
+Description=Fix and Sync Dpkg Status from SquashFS Layers and Info
+After=local-fs.target
+Before=apt-daily.service apt-daily-upgrade.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/fix-dpkg-status.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

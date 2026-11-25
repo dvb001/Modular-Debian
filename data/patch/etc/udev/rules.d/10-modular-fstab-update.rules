@@ -1,0 +1,2 @@
+ACTION=="add|change|remove", SUBSYSTEM=="block", KERNEL!="loop*|ram*", RUN+="/sbin/udev-fstab-update"
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="loop*", ENV{UDISKS_IGNORE}="1"

@@ -1,0 +1,15 @@
+#!/bin/sh -e
+# fix-live-overlay hook: ensures the patched 9990-misc-helpers.sh 
+# is always injected into the initramfs during update-initramfs.
+
+PREREQ="live-boot"
+prereqs() { echo "$PREREQ"; }
+case "${1}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+DST="${DESTDIR}/usr/lib/live/boot/9990-misc-helpers.sh"
+ls -l $DST
+sed -i 's|rootfs_dest_backing=\"\${rootfs_dest_backing} \${fs}"|rootfs_dest_backing=\"\${fs} \${rootfs_dest_backing}\"|g' $DST

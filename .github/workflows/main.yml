@@ -1,0 +1,103 @@
+name: Build Modular Live ISO
+
+on:
+  # 1. 允许手动触发，并可选择具体构建哪个步骤
+  workflow_dispatch:
+    inputs:
+      gui_desktops:
+        description: '选择桌面组合（空格分隔）'
+        required: true
+        default: 'mate xfce'
+        type: string
+      target_version:
+        description: '输入版本名（bookworm/trixie/jammy等）'
+        required: true
+        default: 'bookworm'
+        type: string
+
+  # 2. 只有推送形如 v1.0.0 的标签时才自动触发
+  push:
+    tags:
+      - 'v*' # 例如推送 v1.0.0 会触发
+
+  # 每次推送代码到 main 分支时也可自动触发（不需要可自行注释掉）
+  #push:
+  #  branches: [ "main" ]
+permissions:
+  contents: write
+  
+jobs:
+  build-iso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120 # 编译系统耗时较久，建议设置长一点的超时时间
+    container:
+      image: debian:bookworm       # 或者使用你指定的镜像，如 ubuntu:latest
+      options: --privileged        # 开启特权模式，赋予容器类似宿主机的内核操作权限
+    env:
+      # 将 GitHub Actions 的输入赋值给自定义环境变量
+      GUI_DESKTOPS: ${{ inputs.gui_desktops }}
+      TARGET_VERSION: ${{ inputs.target_version }} # 如果你还有其他输入
+          
+    steps:
+      # 步骤 1：检出仓库代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 步骤 2：赋予 build.sh 执行权限
+      - name: Make build script executable
+        run: chmod +x ./build.sh
+
+      - name: prepare
+        run: apt-get update && apt-get install -y sudo fuse-overlayfs
+
+      # 步骤 3：运行构建脚本
+      # 核心解决交互问题：通过 `echo "y"` 自动回应清理历史记录的 `read -p` 提示
+      - name: install basic packages
+        run: |
+          sudo ./build.sh prep
+          
+      - name: build base
+        run: |
+          sudo TARGET_VERSION="$TARGET_VERSION" GUI_DESKTOPS="$GUI_DESKTOPS" ./build.sh base
+          
+      - name: build devtools
+        run: |
+          echo 'y' | sudo TARGET_VERSION="$TARGET_VERSION" GUI_DESKTOPS="$GUI_DESKTOPS" ./build.sh dev
+
+      - name: build xorg
+        run: |
+          echo 'y' | sudo TARGET_VERSION="$TARGET_VERSION" GUI_DESKTOPS="$GUI_DESKTOPS" ./build.sh xorg
+
+      - name: build gui
+        run: |
+          echo 'y' | sudo TARGET_VERSION="$TARGET_VERSION" GUI_DESKTOPS="$GUI_DESKTOPS" ./build.sh gui
+
+      - name: build iso
+        run: |
+          sudo TARGET_VERSION="$TARGET_VERSION" GUI_DESKTOPS="$GUI_DESKTOPS" ./build.sh boot
+
+      # 步骤 4：检查并整理输出产物
+      - name: Prepare Artifacts
+        run: |
+          mkdir -p iso_output
+          # 将生成的 ISO 镜像复制到统一的产物目录
+          cp -v target/*.iso iso_output/
+
+      # 步骤 5：上传构建完成的 ISO 镜像及模块到 GitHub
+      - name: Upload ISO Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-iso-${{ env.TARGET_VERSION }}
+          path: iso_output/
+          retention-days: 7
+
+      # 步骤：上传文件到 GitHub Release
+      - name: Release and Upload ISO
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v') # 通常通过打标签（如 v1.0.0）来触发 Release
+        with:
+          files: |
+            target/*.iso
+          # body: "这是自动构建的 Debian 模块化 Live 系统。"
+          # draft: false
+          # prerelease: false

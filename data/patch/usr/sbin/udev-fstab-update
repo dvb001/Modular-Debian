@@ -1,0 +1,125 @@
+#!/bin/sh
+# Manage /etc/fstab entries and /mnt mountpoints for block devices
+# invoked from udev rules.
+
+set -u
+
+BOOTCMD_CFG="/etc/bootcmd.cfg"
+FSTAB="/etc/fstab"
+INITRD_LIVE_DIR="/mnt/live"
+
+ACTION="${ACTION:-}"
+DEVNAME="${DEVNAME:-}"
+ID_FS_TYPE="${ID_FS_TYPE:-}"
+
+[ -n "$DEVNAME" ] || exit 0
+
+# Optional cheatcode to skip hard drive / block fstab updates
+if [ -f "$BOOTCMD_CFG" ] && grep -Eqo '(^|[[:space:]])nohd([[:space:]]|$)' "$BOOTCMD_CFG"; then
+    exit 0
+fi
+
+DEVICE="${DEVNAME#/dev/}"
+MNTPT="/mnt/$DEVICE"
+if [ -d "${INITRD_LIVE_DIR}/mnt/${DEVICE}" ]; then
+    MNTPT="${INITRD_LIVE_DIR}${MNTPT}"
+fi
+
+FS="$ID_FS_TYPE"
+if [ -z "$FS" ] && [ -x /sbin/blkid ]; then
+    FS="$(/sbin/blkid -o value -s TYPE "$DEVNAME" 2>/dev/null || true)"
+fi
+
+GVICON=""
+case "$DEVICE" in
+    sr*) GVICON=",comment=x-gvfs-icon=media-optical-symbolic" ;;
+esac
+
+MOPT=""
+NMOPT=""
+RMOPT=""
+
+setup_mount_options() {
+    if [ -f "$BOOTCMD_CFG" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            for token in $line; do
+                case "$token" in
+                    mopt=*)  MOPT="${token#mopt=}" ;;
+                    nmopt=*) NMOPT="${token#nmopt=}" ;;
+                    rmopt=*) RMOPT="${token#rmopt=}" ;;
+                esac
+            done
+        done < "$BOOTCMD_CFG"
+    fi
+
+    [ -n "$MOPT" ]  || MOPT="users,noatime,nodiratime,suid,dev,exec,async,nofail,x-systemd.device-timeout=1s"
+    [ -n "$NMOPT" ] || NMOPT="noatime,nodiratime,suid,nodev,exec,async,nofail,x-systemd.device-timeout=1s"
+    [ -n "$RMOPT" ] || RMOPT="noatime,nodiratime,suid,dev,exec,async,nofail"
+
+    if [ -e /lib/udev/rules.d/80-udisks2.rules ] || [ -e /usr/lib/udev/rules.d/80-udisks2.rules ]; then
+        MOPT="${MOPT},comment=x-gvfs-show${GVICON}"
+        NMOPT="${NMOPT},comment=x-gvfs-show${GVICON}"
+    fi
+}
+
+# Lock in /dev because /tmp may be read-only during early boot/udev
+LOCK_DIR="/dev/live-fstab-lock"
+
+acquire_lock() {
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        sleep 0.1
+    done
+}
+
+release_lock() {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+remove_fstab_entry() {
+    [ -f "$FSTAB" ] || return 0
+    tmp_fstab="${FSTAB}.tmp.$$"
+    awk -v dev="$DEVNAME" '$1 != dev { print }' "$FSTAB" > "$tmp_fstab" && mv "$tmp_fstab" "$FSTAB"
+}
+
+fstab_update() {
+    [ -n "$FS" ] || return 0
+    remove_fstab_entry
+
+    if [ "$FS" = "swap" ]; then
+        printf '%s none swap sw,pri=1 0 0\n' "$DEVNAME" >> "$FSTAB"
+        return 0
+    fi
+
+    mkdir -p "$MNTPT"
+    case "$FS" in
+        vfat)
+            printf '%s %s vfat %s,umask=0,check=s,utf8 0 0\n' "$DEVNAME" "$MNTPT" "$MOPT" >> "$FSTAB"
+            ;;
+        ntfs|ntfs3)
+            printf '%s %s %s %s 0 0\n' "$DEVNAME" "$MNTPT" "$FS" "$NMOPT" >> "$FSTAB"
+            chmod 777 "$MNTPT" 2>/dev/null || true
+            ;;
+        linux_raid_member)
+            printf '%s %s %s %s 0 0\n' "$DEVNAME" "$MNTPT" "$FS" "$RMOPT" >> "$FSTAB"
+            chmod 777 "$MNTPT" 2>/dev/null || true
+            ;;
+        *)
+            printf '%s %s %s %s 0 0\n' "$DEVNAME" "$MNTPT" "$FS" "$MOPT" >> "$FSTAB"
+            ;;
+    esac
+}
+
+setup_mount_options
+
+acquire_lock
+trap 'release_lock' EXIT INT TERM
+
+case "$ACTION" in
+    add|change)
+        fstab_update
+        ;;
+    remove)
+        remove_fstab_entry
+        rmdir "$MNTPT" 2>/dev/null || true
+        ;;
+esac
